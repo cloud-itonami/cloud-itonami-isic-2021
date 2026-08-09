@@ -1,0 +1,458 @@
+(ns pesticidemfg.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2: this repo previously had no demo
+  page and no generator at all. This namespace drives the REAL actor
+  stack -- `pesticidemfg.operation` (the langgraph-clj StateGraph) ->
+  `pesticidemfg.governor` -> `pesticidemfg.store` -- through a scenario
+  adapted from this repo's own `pesticidemfg.sim` demo driver
+  (`clojure -M:dev:run`, run BEFORE writing this file to confirm the
+  subject ids it uses actually exist in `pesticidemfg.store`'s seeded
+  sample data: batches `batch-001`/`batch-002`/`batch-003` and
+  equipment `blender-001`/`mixer-002` all do), trimmed to a
+  representative subset and re-ordered so the page shows both a full
+  clean lifecycle and every distinct HARD-hold rule this governor can
+  raise on the seeded data.
+
+  EVERY id, weight, concentration, disposition, record number and hold
+  reason in the generated page comes from actually executing that stack:
+  either read back out of the store and its append-only ledger after the
+  graph ran, or taken from the state each `langgraph.graph/run*` call
+  itself returned (`:disposition`, `:verdict`, `:audit`). Nothing on the
+  page is hand-typed domain data. The one deliberately hand-written table is
+  `action-gate-rows`, which documents this actor's own fixed op
+  contract (`pesticidemfg.governor`/`pesticidemfg.phase`), not runtime
+  telemetry, and says so.
+
+  DETERMINISTIC: no timestamps and no randomness enter the page, so two
+  consecutive runs are byte-identical (verify by diffing them).
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
+            [jp-go-dds.skin]
+            [langgraph.graph :as g]
+            [pesticidemfg.operation :as op]
+            [pesticidemfg.registry :as registry]
+            [pesticidemfg.store :as store]))
+
+(def ^:private coordinator
+  {:actor-id "coord-1" :actor-role :plant-coordinator :phase 3})
+
+(defn- run-summary
+  "Distils ONE real graph run into the row the page shows. Every field
+  is read out of the state the actor itself returned -- `:disposition`
+  is what `pesticidemfg.phase`/`pesticidemfg.governor` decided,
+  `:violations` are the governor's own violation maps, `:approved?` is
+  the `:approval-granted` fact the `:request-approval` node wrote.
+
+  This exists because the ledger alone cannot answer two questions the
+  console needs: which EQUIPMENT/BATCH a *held* request targeted (a
+  HARD hold never writes a store record, and the ledger fact's own
+  `:basis` carries rule names rather than the target id), and whether a
+  commit was auto or human-approved (both land as `:t :committed`)."
+  [request result]
+  (let [st (:state result)]
+    {:subject      (:subject request)
+     :op           (:op request)
+     :equipment-id (get-in request [:value :equipment-id])
+     :batch-id     (or (get-in request [:value :batch-id])
+                       (when (= :log-production-batch (:op request))
+                         (:subject request)))
+     :disposition  (:disposition st)
+     :violations   (get-in st [:verdict :violations])
+     :confidence   (get-in st [:verdict :confidence])
+     :approved?    (boolean (some #(= :approval-granted (:t %)) (:audit st)))}))
+
+(defn- exec!
+  "Runs one request through the real actor. When it escalates, a human
+  plant supervisor approves it (`:resume?`) -- the same two-call shape
+  `pesticidemfg.sim` uses. Returns the `run-summary` of the FINAL state."
+  [actor tid request & [{:keys [approve?]}]]
+  (let [r (g/run* actor {:request request :context coordinator} {:thread-id tid})
+        r (if approve?
+            (g/run* actor {:approval {:status :approved :by "coord-1"}}
+                    {:thread-id tid :resume? true})
+            r)]
+    (run-summary request r)))
+
+(defn run-demo!
+  "Seeds a fresh `MemStore`, builds the REAL PesticideOperationActor and
+  runs one scenario through it. Returns `{:db store :runs [..]}` -- the
+  store the actor wrote, plus one `run-summary` per request taken from
+  the state the graph itself returned.
+
+  Clean lifecycle (`batch-001`, verified + registered, herbicide):
+    - `:log-production-batch` -- governor-clean and high-confidence, so
+      the phase-3 `:auto` set lets it commit with no human;
+    - `:schedule-maintenance` `mnt-1` on `blender-001` (verified +
+      registered blending tank) -- `:schedule-maintenance` is never in
+      any phase's `:auto` set, so it escalates and a human plant
+      supervisor approves it, drafting record `MNT-000000`;
+    - `:flag-safety-concern` `concern-1` -- always high-stakes, so it
+      always escalates; approved;
+    - `:coordinate-shipment` `ship-1` (500 kg, within `batch-001`'s own
+      5000 kg logged weight) -- escalates, approved, drafting record
+      `SHP-000000` and moving the batch's own shipped-to-date total.
+
+  Then seven HARD holds, none of which ever reaches a human -- the
+  actor's `:decide` node routes a HARD verdict straight to `:hold`, so
+  `:request-approval` is never entered:
+    - `:line-actuate-blocked`      -- `mnt-3` asks to directly ACTUATE
+                                      `blender-001` (`:actuate-line?
+                                      true`). PERMANENT, no phase and no
+                                      approver can override it.
+    - `:registration-decision-blocked` -- `batch-003` asks this actor to
+                                      DECIDE a pesticide registration.
+                                      Also permanent.
+    - `:equipment-not-verified`    -- `mnt-2` against `mixer-002`, an
+                                      unverified/unregistered high-shear
+                                      mixer.
+    - `:batch-not-verified`        -- `ship-2` against `batch-003`, an
+                                      unverified/unregistered batch.
+    - `:shipment-weight-exceeded`  -- `ship-3` asks for 1000 kg from
+                                      `batch-002`, whose own record
+                                      already shows 7500 of 8000 kg
+                                      shipped; the governor recomputes
+                                      this from the batch's own fields.
+    - `:active-ingredient-exceeds-label-limit` -- a 95.0% patch on
+                                      `batch-002`, an insecticide whose
+                                      own label ceiling is 25.0%.
+    - `:already-scheduled`         -- `mnt-1` a second time."
+  []
+  (let [db (-> (store/mem-store) (store/sample-data!))
+        actor (op/build db)
+        runs
+        [;; ---- clean lifecycle: batch-001 ----
+         (exec! actor "b1-log"
+                {:op :log-production-batch :effect :propose :subject "batch-001"
+                 :patch {:product-type :herbicide :active-ingredient-pct 41.0
+                         :last-assessed "2026-07-14"}})
+
+         (exec! actor "b1-maintenance"
+                {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+                 :value {:equipment-id "blender-001" :maintenance-type :seal-inspection
+                         :scheduled-date "2026-08-01" :actuate-line? false}}
+                {:approve? true})
+
+         (exec! actor "b1-concern"
+                {:op :flag-safety-concern :effect :propose :subject "concern-1"
+                 :value {:equipment-id "blender-001" :severity :moderate
+                         :description "配合工程周辺の有効成分曝露リスク上昇"}}
+                {:approve? true})
+
+         (exec! actor "b1-shipment"
+                {:op :coordinate-shipment :effect :propose :subject "ship-1"
+                 :value {:batch-id "batch-001" :weight-kg 500.0
+                         :destination "distributor-yard-north"}}
+                {:approve? true})
+
+         ;; ---- HARD holds: never reach a human ----
+         (exec! actor "h-actuate"
+                {:op :schedule-maintenance :effect :propose :subject "mnt-3"
+                 :value {:equipment-id "blender-001" :maintenance-type :force-run
+                         :scheduled-date "2026-09-01" :actuate-line? true}})
+
+         (exec! actor "h-registration"
+                {:op :log-production-batch :effect :propose :subject "batch-003"
+                 :patch {:decide-registration? true}})
+
+         (exec! actor "h-equipment"
+                {:op :schedule-maintenance :effect :propose :subject "mnt-2"
+                 :value {:equipment-id "mixer-002" :maintenance-type :blade-inspection
+                         :scheduled-date "2026-08-01" :actuate-line? false}})
+
+         (exec! actor "h-batch"
+                {:op :coordinate-shipment :effect :propose :subject "ship-2"
+                 :value {:batch-id "batch-003" :weight-kg 1000.0
+                         :destination "distributor-yard-south"}})
+
+         (exec! actor "h-weight"
+                {:op :coordinate-shipment :effect :propose :subject "ship-3"
+                 :value {:batch-id "batch-002" :weight-kg 1000.0
+                         :destination "distributor-yard-east"}})
+
+         (exec! actor "h-label"
+                {:op :log-production-batch :effect :propose :subject "batch-002"
+                 :patch {:active-ingredient-pct 95.0}})
+
+         (exec! actor "h-double"
+                {:op :schedule-maintenance :effect :propose :subject "mnt-1"
+                 :value {:equipment-id "blender-001" :maintenance-type :seal-inspection
+                         :scheduled-date "2026-08-01" :actuate-line? false}})]]
+    {:db db :runs runs}))
+
+;; ----------------------------- rendering -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
+
+(defn- kw-name [v]
+  (if (keyword? v) (name v) (str v)))
+
+(defn- outcome-cell
+  "One real run's final outcome. `:hold` with governor violations is a
+  HARD hold: the `:decide` node routed it straight to `:hold`, so it
+  never reached the approver."
+  [{:keys [disposition violations approved?]}]
+  (cond
+    (seq violations)
+    (str "<span class=\"critical\">HARD hold &middot; "
+         (esc (str/join ", " (map (comp kw-name :rule) violations))) "</span>")
+    (and (= :commit disposition) approved?)
+    "<span class=\"ok\">human-approved &amp; committed</span>"
+    (= :commit disposition) "<span class=\"ok\">auto-committed</span>"
+    (= :escalate disposition) "<span class=\"warn\">awaiting approval</span>"
+    (= :hold disposition) "<span class=\"warn\">held (phase-disabled)</span>"
+    :else (str "<span class=\"muted\">" (esc (kw-name disposition)) "</span>")))
+
+(defn- last-run-for
+  "The last run in the scenario that targeted `id` through key `k`
+  (`:equipment-id` or `:batch-id`) -- a real join, since a held request
+  writes no store record to join through."
+  [runs k id]
+  (last (filter #(= id (get % k)) runs)))
+
+(defn- target-status-cell [runs k id]
+  (if-let [r (last-run-for runs k id)]
+    (outcome-cell r)
+    "<span class=\"muted\">no request this run</span>"))
+
+(defn- ready-cell [ready?]
+  (if ready?
+    "<span class=\"ok\">verified &amp; registered</span>"
+    "<span class=\"warn\">unverified / unregistered</span>"))
+
+(defn- label-cell
+  "The batch's own recorded active-ingredient concentration against its
+  own product type's label ceiling -- both re-derived here through the
+  very same `pesticidemfg.registry` predicate the governor uses."
+  [{:keys [product-type active-ingredient-pct]}]
+  (let [limit (registry/active-ingredient-label-limit-for product-type)]
+    (cond
+      (nil? active-ingredient-pct) "<span class=\"muted\">not recorded</span>"
+      (registry/active-ingredient-exceeds-label-limit? product-type active-ingredient-pct)
+      (str "<span class=\"critical\">" (esc active-ingredient-pct) "% &gt; "
+           (esc limit) "% ceiling</span>")
+      :else
+      (str "<span class=\"ok\">" (esc active-ingredient-pct) "%</span>"
+           " <span class=\"muted\">/ " (esc (or limit "n-a")) "% ceiling</span>"))))
+
+(defn- batch-row [runs {:keys [id product-type material weight-kg shipped-weight-kg
+                              last-assessed]
+                       :as b}]
+  (format (str "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td>"
+               "<td class=\"num\">%s</td><td>%s</td><td>%s</td>"
+               "<td class=\"num\">%s</td><td>%s</td><td>%s</td></tr>")
+          (esc id) (esc (kw-name product-type)) (esc material)
+          (esc weight-kg)
+          (label-cell b)
+          (ready-cell (registry/batch-ready? b))
+          (esc (or shipped-weight-kg 0.0))
+          (esc (or last-assessed "—"))
+          (target-status-cell runs :batch-id id)))
+
+(defn- equipment-row [runs all-maint {:keys [id kind last-maintenance-date
+                                             last-scheduled-maintenance-date]
+                                      :as eq}]
+  (let [drafts (filter #(= id (:equipment-id %)) all-maint)]
+    (format (str "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td>"
+                 "<td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>")
+            (esc id) (esc (kw-name kind))
+            (ready-cell (registry/equipment-ready? eq))
+            (esc (or last-maintenance-date "—"))
+            (esc (or last-scheduled-maintenance-date "—"))
+            (if (seq drafts)
+              (str/join ", " (map #(str "<code>" (esc (:id %)) "</code> &rarr; <code>"
+                                        (esc (:maintenance-number %)) "</code>")
+                                  drafts))
+              "<span class=\"muted\">none</span>")
+            (target-status-cell runs :equipment-id id))))
+
+(defn- request-row [{:keys [subject op equipment-id batch-id confidence] :as r}]
+  (format (str "        <tr><td><code>%s</code></td><td><code>%s</code></td>"
+               "<td><code>%s</code></td><td class=\"num\">%s</td><td>%s</td></tr>")
+          (esc subject) (esc (kw-name op))
+          (esc (or equipment-id batch-id "—"))
+          (esc (if (nil? confidence) "—" confidence))
+          (outcome-cell r)))
+
+(defn- ledger-row [{:keys [t op subject basis]}]
+  (format (str "        <tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td>"
+               "<td>%s</td></tr>")
+          (esc (kw-name t)) (esc (kw-name (or op :n-a))) (esc subject)
+          (if (= :governor-hold t)
+            (str "<span class=\"critical\">"
+                 (esc (str/join ", " (map kw-name basis))) "</span>")
+            (esc (str/join ", " (map kw-name basis))))))
+
+(defn- draft-row [kind record]
+  (format "        <tr><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td>%s</td></tr>"
+          (esc (get record "record_id")) (esc kind)
+          (esc (or (get record "maintenance_id") (get record "shipment_id")))
+          (esc (or (get record "equipment_id") "—"))))
+
+(defn- concern-row [{:keys [id equipment-id severity description]}]
+  (format "        <tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+          (esc id) (esc (or equipment-id "—")) (esc (kw-name severity)) (esc description)))
+
+(def ^:private action-gate-rows
+  ;; Static description of this actor's own closed op contract
+  ;; (`pesticidemfg.governor/allowed-ops`, `pesticidemfg.phase/phases`)
+  ;; -- documentation of fixed behavior, not runtime telemetry, so it is
+  ;; legitimately hand-described rather than derived from a live run.
+  ["        <tr><td><code>:log-production-batch</code></td><td><span class=\"ok\">phase-3 auto-commit when governor-clean</span> &middot; product type, concentration plausibility and label ceiling all independently re-derived</td></tr>"
+   "        <tr><td><code>:schedule-maintenance</code></td><td><span class=\"warn\">ALWAYS human approval &middot; never in any phase's <code>:auto</code> set</span> &middot; equipment verified/registered re-checked; direct line actuation permanently blocked</td></tr>"
+   "        <tr><td><code>:flag-safety-concern</code></td><td><span class=\"warn\">ALWAYS human approval &middot; permanently high-stakes</span> &middot; never blocked on the referenced unit being verified</td></tr>"
+   "        <tr><td><code>:coordinate-shipment</code></td><td><span class=\"warn\">phase-3: human approval (not auto-eligible)</span> &middot; batch verified/registered re-checked; shipped-to-date + requested weight recomputed from the batch's own record</td></tr>"
+   "        <tr><td colspan=\"2\"><span class=\"critical\">Permanently out of scope, no override at any phase:</span> actuating a blending tank / high-shear mixer / filling-packaging line, and deciding or granting a pesticide registration or product-label approval (exclusively a regulatory authority's call).</td></tr>"])
+
+(defn render
+  "Renders the whole operator-console document from `run-demo!`'s result
+  -- `:db`, the store the real actor wrote, and `:runs`, the per-request
+  outcomes the real graph returned."
+  [{:keys [db runs]}]
+  (let [ledger (vec (store/ledger db))
+        batches (store/all-batches db)
+        equipment (store/all-equipment db)
+        all-maint (store/all-maintenance db)
+        concerns (vec (store/safety-concerns db))
+        maint-drafts (vec (store/maintenance-history db))
+        ship-drafts (vec (store/shipment-history db))
+        holds (filter #(= :governor-hold (:t %)) ledger)]
+    (str
+     "<!DOCTYPE html>\n"
+     "<html lang=\"en\">\n"
+     "<head>\n"
+     "  <meta charset=\"utf-8\">\n"
+     "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n"
+     "  <meta name=\"color-scheme\" content=\"light\">\n"
+     "  <meta name=\"theme-color\" content=\"#ffffff\">\n"
+     "  <title>cloud-itonami-isic-2021 &middot; pesticide &amp; agrochemical plant operations &mdash; Operator Console</title>\n"
+     "  <style>\n"
+     (jp-go-dds.skin/dds+skin)
+     "\n  </style>\n"
+     "</head>\n"
+     "<body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Manufacture of pesticides and other agrochemical products (ISIC 2021) &mdash; Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample &middot; governor-gated &middot; maintenance scheduling always human-approved</span>\n"
+     "</header>\n"
+     "<main>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Production batches</h2>\n"
+     "    <p class=\"muted\">Demo snapshot &mdash; build-time-generated from <code>pesticidemfg.store</code> after a real "
+     "<code>pesticidemfg.operation</code> actor run, via <code>pesticidemfg.render-html</code> "
+     "(<code>clojure -M:dev:render-html</code>). Every value below is read back out of the store, not hand-typed.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Batch</th><th>Product type</th><th>Material</th><th>Logged weight (kg)</th>"
+     "<th>Active ingredient vs label ceiling</th><th>Ground truth</th><th>Shipped to date (kg)</th>"
+     "<th>Last assessed</th><th>Last request outcome</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial batch-row runs) batches)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Formulation / packaging equipment</h2>\n"
+     "    <p class=\"muted\">Maintenance windows are DRAFTS. This actor never actuates a blending tank, high-shear mixer or filling/packaging line &mdash; that attempt is a permanent HARD hold.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Unit</th><th>Kind</th><th>Ground truth</th><th>Last maintenance</th>"
+     "<th>Last scheduled window</th><th>Draft maintenance records</th><th>Last request outcome</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial equipment-row runs all-maint) equipment)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Action gate (Pesticide &amp; Agrochemical Plant Operations Governor)</h2>\n"
+     "    <p class=\"muted\">HARD holds cannot be overridden by any phase or any approver. Equipment/batch verification, shipment weight and active-ingredient concentration are all independently recomputed from the store's own records &mdash; never taken from the advisor's self-report.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Gate</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" action-gate-rows) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Coordination requests (this run)</h2>\n"
+     "    <p class=\"muted\">Every request this scenario put through the actor, in order, with the disposition the graph itself returned. "
+     (esc (count runs)) " requests; "
+     (esc (count (filter (comp seq :violations) runs))) " were HARD-held by the governor and so never reached the approver; "
+     (esc (count (filter :approved? runs))) " were escalated and approved by a human plant supervisor.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Subject</th><th>Op</th><th>Target</th><th>Advisor confidence</th><th>Outcome</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map request-row runs)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Audit ledger (this run)</h2>\n"
+     "    <p class=\"muted\">Append-only decision-fact log written by the actor's <code>:commit</code> and <code>:hold</code> nodes &mdash; "
+     (esc (count ledger)) " facts, of which "
+     (esc (count holds)) " are HARD governor holds "
+     "(the <code>:decide</code> node routes a HARD verdict straight to <code>:hold</code>, so <code>:request-approval</code> is never entered).</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Fact</th><th>Op</th><th>Subject</th><th>Basis</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map ledger-row ledger)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Draft records issued</h2>\n"
+     "    <p class=\"muted\">Unsigned drafts only &mdash; a record number is the coordinator's paperwork, not a dispatched freight movement, an executed maintenance job, or any registration/label decision.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Record</th><th>Kind</th><th>Subject</th><th>Equipment</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (concat (map (partial draft-row "maintenance-schedule-draft") maint-drafts)
+                            (map (partial draft-row "shipment-coordination-draft") ship-drafts)))
+     "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Safety concerns logged</h2>\n"
+     "    <p class=\"muted\">A safety concern always escalates to a human plant supervisor regardless of confidence, and is never blocked on the referenced unit being verified.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Concern</th><th>Equipment</th><th>Severity</th><th>Description</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map concern-row concerns)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "</main>\n"
+     "<footer>\n"
+     "  <p>Generated by <code>clojure -M:dev:render-html</code> from the real actor stack "
+     "(<code>pesticidemfg.operation</code> &rarr; <code>pesticidemfg.governor</code> &rarr; <code>pesticidemfg.store</code>). "
+     "Deterministic: no timestamps or randomness enter this page, so consecutive runs are byte-identical.</p>\n"
+     "</footer>\n"
+     "</body>\n"
+     "</html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db runs] :as demo} (run-demo!)
+        html (render demo)]
+    (.mkdirs (java.io.File. (or (.getParent (java.io.File. ^String out)) ".")))
+    (spit out html)
+    (println "wrote" out "-"
+             (count runs) "requests,"
+             (count (store/ledger db)) "ledger facts,"
+             (count (filter #(= :governor-hold (:t %)) (store/ledger db))) "HARD holds,"
+             (count (store/maintenance-history db)) "maintenance drafts,"
+             (count (store/shipment-history db)) "shipment drafts,"
+             (count (store/safety-concerns db)) "safety concerns")))
