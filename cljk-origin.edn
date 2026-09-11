@@ -1,0 +1,18 @@
+{:format :kotoba.cljk-origin/v1
+ :renamed-on "2026-09-11"
+ :decision "adr-2609111500-cljk-rename-all-clojure-source (com-junkawasaki/root 90-docs/adr; owner instruction 2026-09-11)"
+ :rule "value = the extension the file had before the rename. A path ending in .clj.cljk or .cljs.cljk kept it in the name because both platform files existed (or the plain target was taken)."
+ :origins
+ {"src/pesticidemfg/advisor.cljk" ".cljc"
+  "src/pesticidemfg/governor.cljk" ".cljc"
+  "src/pesticidemfg/operation.cljk" ".cljc"
+  "src/pesticidemfg/phase.cljk" ".cljc"
+  "src/pesticidemfg/registry.cljk" ".cljc"
+  "src/pesticidemfg/render_html.cljk" ".clj"
+  "src/pesticidemfg/sim.cljk" ".cljc"
+  "src/pesticidemfg/store.cljk" ".cljc"
+  "test/pesticidemfg/governor_contract_test.cljk" ".cljc"
+  "test/pesticidemfg/operation_test.cljk" ".cljc"
+  "test/pesticidemfg/phase_test.cljk" ".cljc"
+  "test/pesticidemfg/registry_test.cljk" ".cljc"
+  "test/pesticidemfg/store_contract_test.cljk" ".cljc"}}
