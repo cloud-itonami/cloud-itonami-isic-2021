@@ -5,13 +5,13 @@
  ;; standalone (forkable outside the workspace); the :local/root paths
  ;; only resolve inside the monorepo checkout -- a standalone fork
  ;; should override them with git coordinates. langchain is pinned here
- ;; directly (not only under :dev) so a bare `clojure -M:test` works
+ ;; directly (not only under :dev) so a bare `kbb -M:test` works
  ;; offline inside the monorepo checkout without depending on
  ;; langgraph's own transitive git/sha pin being fetchable.
  ;; jp-go-digital-design-system is this workspace's BASE design system
  ;; (デジタル庁デザインシステム). Unlike langgraph/langchain it is pinned
  ;; by git coordinates rather than :local/root, so
- ;; `clojure -M:dev:render-html` also works in a standalone fork. Only
+ ;; `kbb -M:dev:render-html` also works in a standalone fork. Only
  ;; `pesticidemfg.render-html` (build-time only) requires it.
  :deps {
         ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
@@ -32,9 +32,9 @@
   :dev {:override-deps
         {io.github.kotoba-lang/langchain
          {:local/root "../../kotoba-lang/langchain"}}}
-  ;; clojure -M:dev:run  -> drive the demo through one OperationActor
+  ;; kbb -M:dev:run  -> drive the demo through one OperationActor
   :run {:main-opts ["-m" "pesticidemfg.sim"]}
-  ;; clojure -M:dev:render-html [out-file] -> regenerate
+  ;; kbb -M:dev:render-html [out-file] -> regenerate
   ;; docs/samples/operator-console.html by driving the REAL actor
   ;; (flagship checklist item 2). Deterministic: reruns are byte-identical.
   :render-html {:main-opts ["-m" "pesticidemfg.render-html"]}
