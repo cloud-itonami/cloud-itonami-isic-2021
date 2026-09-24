@@ -29,7 +29,7 @@
 
   Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
-  (:require [kotoba.lang.text :as str]
+  (:require [kotoba.io :as kio] [kotoba.lang.text :as str]
             [jp-go-dds.skin]
             [langgraph.graph :as g]
             [pesticidemfg.operation :as op]
@@ -447,7 +447,7 @@
   (let [out (or (first args) "docs/samples/operator-console.html")
         {:keys [db runs] :as demo} (run-demo!)
         html (render demo)]
-    (.mkdirs (java.io.File. (or (.getParent (java.io.File. ^String out)) ".")))
+    (kio/mkdirs (kio/file (or (kio/parent (kio/file ^String out)) ".")))
     (spit out html)
     (println "wrote" out "-"
              (count runs) "requests,"
