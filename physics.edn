@@ -1,0 +1,42 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; The README has no "Robotics premise" section; its Scope names the plant
+;; this actor coordinates (ISIC 2021): formulation/mixing equipment (blending
+;; tank, high-shear mixer) and the filling/packaging line for herbicides,
+;; insecticides, fungicides and the other agrochemical families. The
+;; physical work of that plant taken here: pumping a suspension concentrate
+;; from the blending tank to the filler, emptying the blending tank between
+;; batches, and palletising filled 20 L jerrycans at the end of the line.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-2021"
+ :cases
+ [{:id :sc-to-filler
+   :kind :pipe-flow
+   :procedure "pump a suspension-concentrate formulation from the blending tank to the filling-machine header (50 mm, 40 m, 4 m rise)"
+   :params {:q-m3s 0.002 :diameter-m 0.05 :length-m 40.0 :roughness-m 1.5e-6 :density-kg-m3 1150.0
+            :pump-efficiency 0.55 :elevation-m 4.0}
+   :sweep {:param :viscosity-pa-s :values [0.05 0.1 0.2 0.4 0.8]}
+   :quantity :pressure-drop-pa
+   :limit {:max 600000.0 :basis "estimate: 6 bar discharge limit assumed for the lobe/diaphragm transfer pump"}
+   :boundary {:lo 0.01 :hi 3.0}}
+  {:id :blending-tank-empty
+   :kind :tank-drain
+   :procedure "robot opens the blending tank's bottom outlet to empty a 5 m3 batch (1.6 m) to a 0.05 m heel before the line is flushed"
+   :params {:tank-area-m2 3.1 :h0-m 1.6 :h-target-m 0.05 :cd 0.62 :dt-s 0.5 :max-time-s 14400.0}
+   :sweep {:param :orifice-area-m2 :values [0.001 0.002 0.003 0.005 0.008]}
+   :quantity :time-to-target-s
+   :limit {:max 1200.0 :basis "estimate: 20-minute changeover budget for emptying before the flush"}
+   :boundary {:lo 0.0005 :hi 0.02}}
+  {:id :jerrycan-palletising
+   :kind :manipulator
+   :procedure "arm picks filled jerrycans off the line conveyor and places them on the pallet's top layer"
+   :params {:l1-m 0.70 :l2-m 0.60 :m1-kg 12.0 :m2-kg 8.0
+            :from [0.90 0.20] :to [0.40 0.90] :duration-s 2.5 :steps 500}
+   :sweep {:param :payload-kg :values [5.5 11.0 16.5 22.0 30.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 500.0 :basis "estimate: continuous shoulder torque of a ~50 kg-payload palletising arm class"}
+   :boundary {:lo 1.0 :hi 100.0}}]}
